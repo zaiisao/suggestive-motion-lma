@@ -170,6 +170,61 @@ Outputs in `--out-dir`:
 - `pca_2d.png`, `tsne_2d.png` — projections
 - `per_tier_means.csv` — feature means per class
 
+### Stage 2b: bit-exact paper reproduction (audit mode)
+
+The three accuracies reported in the paper (4-way 57.3%, 3-way 72.1%, binary
+78.7%) were each produced from a different snapshot of the still-growing
+feature directories, on three different dates in April 2026. To make those
+specific numbers auditable and re-runnable, this repo ships per-cutoff
+manifests of every LMA feature file used:
+
+```
+data/manifest_paper_4way_2026-04-15_01-23.csv     # 20,534 files
+data/manifest_paper_3way_2026-04-14_19-16.csv     # 17,880 files
+data/manifest_paper_binary_2026-04-14_21-36.csv   # 18,358 files
+```
+
+Each row is `tier,path,mtime_utc,size_bytes,sha256`. To re-run the classifier
+against the exact paper file set:
+
+```bash
+python scripts/analyze_lma_tiers.py \
+    --manifest data/manifest_paper_4way_2026-04-15_01-23.csv \
+    --max-per-tier 1075 \
+    --out-dir output/audit_4way
+```
+
+This reproduces the published headline numbers **bit-exactly** (verified
+2026-05-25):
+
+| Setting | Paper | Reproduced |
+|---|---|---|
+| 4-way LogReg | 0.5728 | 0.5728 ✓ |
+| 4-way RandomForest | 0.5742 | 0.5742 ✓ |
+| 3-way LogReg | 0.7206 | 0.7206 ✓ |
+| 3-way RandomForest | 0.7020 | 0.7020 ✓ |
+| Binary LogReg | 0.7869 | 0.7869 ✓ |
+| Binary RandomForest | 0.7824 | 0.7824 ✓ |
+
+`scripts/verify_paper_reproduction.sh` runs all three configurations in
+sequence. `scripts/check_manifest_hashes.py <manifest.csv>` validates that
+the feature files referenced by a manifest still hash-match (use this before
+publishing a result to catch silent file mutation).
+
+`scripts/build_manifest.py` is the tool used to generate the manifests in
+the first place. To produce one for a new analysis snapshot:
+
+```bash
+python scripts/build_manifest.py \
+    --tier0-dirs <...> --tier1-dirs <...> --tier2-dirs <...> --tier3-dirs <...> \
+    --cutoff '2026-04-15 01:23:30' \
+    --out data/manifest_<your-run>.csv
+```
+
+The cutoff is needed because the feature directories may continue to grow
+after a paper run; the manifest records the exact subset that was visible
+to the classifier at run time.
+
 ### Stage 3: paper figure
 
 `scripts/fig_confusion_matrix.py` regenerates Figure 2 from the published

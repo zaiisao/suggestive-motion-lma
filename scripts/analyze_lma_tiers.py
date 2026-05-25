@@ -27,6 +27,7 @@ Usage:
   python scripts/analyze_lma_tiers.py --binary            # SFW/NSFW
 """
 import argparse
+import csv
 import glob
 import json
 import os
@@ -58,6 +59,26 @@ def _resolve_tier_dirs(tier_idx, cli_dirs):
     if env:
         return [p for p in env.split(os.pathsep) if p]
     return [os.path.join("data", f"tier{tier_idx}")]
+
+
+def _files_from_manifest(manifest_path):
+    """Return {tier: [paths]} from a manifest CSV produced by build_manifest.py."""
+    out = {0: [], 1: [], 2: [], 3: []}
+    with open(manifest_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            t = int(row["tier"])
+            out[t].append(row["path"])
+    for t in out:
+        out[t].sort()
+    return out
+
+
+def _files_from_dirs(roots):
+    files = []
+    for root in roots:
+        files.extend(glob.glob(os.path.join(root, "**/lma_features_*.npy"), recursive=True))
+    return sorted(set(files))
 
 # Same feature order as sorted keys in lma_dict
 FEATURE_NAMES = [
@@ -105,14 +126,8 @@ def aggregate_fragment(arr):
     return out
 
 
-def load_tier(tier_idx, roots):
-    """Load all fragments from a tier, return (N, 110) matrix."""
-    if isinstance(roots, str):
-        roots = [roots]
-    files = []
-    for root in roots:
-        files.extend(glob.glob(os.path.join(root, "**/lma_features_*.npy"), recursive=True))
-    files = sorted(set(files))
+def load_files(files):
+    """Load fragments from an explicit file list, return (N, 110) matrix."""
     rows = []
     for f in files:
         try:
@@ -139,6 +154,10 @@ def main():
     parser.add_argument("--max-per-tier", type=int, default=2000,
                         help="Cap fragments per tier to keep classes balanced")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--manifest", default=None,
+                        help="CSV manifest of files to use (overrides --tierN-dirs). "
+                             "Format: tier,path,mtime_utc,size_bytes,sha256. "
+                             "Produced by scripts/build_manifest.py.")
     for t in (0, 1, 2, 3):
         parser.add_argument(f"--tier{t}-dirs", nargs="+", default=None,
                             help=f"Directories of pre-computed Tier {t} LMA features "
@@ -151,11 +170,19 @@ def main():
     # --- 1. Load data ---
     print("[*] Loading features...")
     tier_data = {}
+    if args.manifest:
+        print(f"[*] Manifest mode: {args.manifest}")
+        tier_files = _files_from_manifest(args.manifest)
+    else:
+        tier_files = {
+            t: _files_from_dirs(_resolve_tier_dirs(t, getattr(args, f"tier{t}_dirs")))
+            for t in (0, 1, 2, 3)
+        }
     for tier in (0, 1, 2, 3):
-        roots = _resolve_tier_dirs(tier, getattr(args, f"tier{tier}_dirs"))
-        print(f"  Tier {tier} <- {roots}")
-        X = load_tier(tier, roots)
-        print(f"    {X.shape[0]} fragments")
+        files = tier_files[tier]
+        print(f"  Tier {tier}: {len(files)} files listed")
+        X = load_files(files)
+        print(f"    -> {X.shape[0]} valid fragments")
         tier_data[tier] = X
 
     # Apply tier merging / dropping

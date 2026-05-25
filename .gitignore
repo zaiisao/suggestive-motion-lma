@@ -25,3 +25,7 @@ output/
 # Allow shipped figures used in the README / paper
 !results/*.png
 !results/*.pdf
+
+# Allow audit manifests (paths + hashes of files used in the paper)
+!data/
+!data/manifest_*.csv
