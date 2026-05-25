@@ -1,4 +1,4 @@
-# Laban Motion Baseline
+# Suggestive-Motion-LMA
 
 Reference implementation for the SIGGRAPH Posters '26 paper **"Appearance-Invariant
 Detection of Suggestive Motion via Laban Movement Descriptors on SMPL Skeletons"**
@@ -18,10 +18,6 @@ Headline results (5-fold CV, balanced 1,075 fragments per class, 20,514 total):
 | Binary SFW/NSFW     | **78.7%** | 50.0% |
 
 The 4-way confusion matrix (`results/fig_cm_4way.pdf`) is Figure 2 of the paper.
-
-> This repository is the **baseline** referenced in the paper's "Future Work"
-> section. The fine-tuned MotionBERT + OMIL extension is tracked in a separate
-> repository.
 
 ---
 
@@ -241,7 +237,7 @@ python scripts/fig_confusion_matrix.py
 ## Expected directory layout
 
 ```
-laban-motion-baseline/
+suggestive-motion-lma/
 ├── core/
 │   └── wham_inference.py         # per-video WHAM + LMA worker
 ├── scripts/
