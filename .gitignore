@@ -1,0 +1,27 @@
+__pycache__/
+*.py[co]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Data / model artifacts — do not commit
+data/
+output/
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.mp4
+*.webm
+*.mkv
+*.avi
+*.mov
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+
+# Allow shipped figures used in the README / paper
+!results/*.png
+!results/*.pdf

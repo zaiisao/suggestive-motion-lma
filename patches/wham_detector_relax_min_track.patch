@@ -1,0 +1,17 @@
+diff --git a/lib/models/preproc/detector.py b/lib/models/preproc/detector.py
+index e8d046a..4d7ad54 100644
+--- a/lib/models/preproc/detector.py
++++ b/lib/models/preproc/detector.py
+@@ -24,10 +24,10 @@ VIT_DIR = osp.join(ROOT_DIR, "third-party/ViTPose")
+ VIS_THRESH = 0.3
+ BBOX_CONF = 0.4
+ TRACKING_THR = 0.25
+-MINIMUM_FRMAES = 30
++MINIMUM_FRMAES = 15          # was 30
+ MINIMUM_JOINTS = 6
+ MAX_TRACK_AGE = 60
+-MIN_TRACK_SECONDS = 2.5
++MIN_TRACK_SECONDS = 1.0      # was 2.5
+ 
+ class DetectionModel(object):
+     def __init__(self, device):
