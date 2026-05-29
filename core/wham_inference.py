@@ -172,7 +172,7 @@ class WHAMLMAProcessor:
                     
                     # 4. Extract 3D data, apply world translation, and strip the dummy batch dimension
                     trans_world = pred['trans_world'].reshape(1, -1, 1, 3) # (1, T, 1, 3)
-                    joints_world = (smpl_output.joints + trans_world).cpu().squeeze(0).numpy() # -> (T, 45, 3)
+                    joints_world = (smpl_output.joints + trans_world).cpu().squeeze(0).numpy() # -> (T, 31, 3) COCO+SPIN (NOT SMPL-24; see LMA fix below)
                     verts_world = (smpl_output.vertices + trans_world).cpu().squeeze(0).numpy() # -> (T, 6890, 3)
                     
                     # 5. Restore all original WHAM dictionary keys for the visualizer
@@ -330,8 +330,14 @@ def process_single_video(video_path, output_root, visualize=False):
         for _id, data in fragments.items():
             print(f"[*] Extracting LMA features for Fragment {_id}...")
             
-            joints = data['joints_world'][:, :24, :]
             verts_array = data['verts_world']
+            # FIX (extended version): WHAM's joints_world is a 31-joint COCO+SPIN layout,
+            # NOT the SMPL-24 order the LMA extractor's IDX map assumes — feeding it
+            # directly mislabels every joint (e.g. "pelvis"->nose, "L_hip"->left eye).
+            # The mesh vertices are correct, so regress the canonical SMPL-24 skeleton
+            # from them. See docs/extended_version_analysis_2026-05-29.md.
+            _Jreg = processor.network.smpl.J_regressor.detach().cpu().numpy()[:24]  # (24, 6890)
+            joints = np.einsum('jk,tkc->tjc', _Jreg, verts_array.astype(np.float32))  # (T, 24, 3)
             
             # A. Calculate Volumes
             volumes = []
