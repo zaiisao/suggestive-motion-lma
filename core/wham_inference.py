@@ -1,25 +1,12 @@
 import sys
 import os
-import multiprocessing as _mp
-# Force spawn so DataLoader / DPVO / multiprocessing workers don't inherit
-# the parent's mid-init CUDA contexts (causes a futex/pipe deadlock where
-# all workers park forever and the 10-min watchdog can't reach them).
-try:
-    _mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    pass
-# Single-threaded BLAS keeps fork-safe libraries from spawning their own
-# thread pools that race with PyTorch's CUDA initialization.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-
 import numpy as np
 np.float = float
 
 sys.setrecursionlimit(5000)
 
 # 1. Get Absolute Path to the project root
-# This assumes wham_inference.py is in <repo>/core/
+# This assumes wham_inference.py is in KineGuard/core/
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, ".."))
 
@@ -35,7 +22,8 @@ for p in [wham_root, dpvo_path, lma_path, vitpose_path]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from lib.models.preproc.slam import SLAMModel
+# NOTE: SLAMModel import is intentionally deferred to the try/except block
+# below so a missing/broken DPVO build only disables global trajectory.
 
 import cv2
 import torch
@@ -70,9 +58,9 @@ except ImportError:
     logger.warning('DPVO (SLAM) is not installed. Global trajectory will default to local camera space!')
     _run_global = False
 
-class WHAMLMAProcessor:
+class KineGuardWHAMProcessor:
     def __init__(self, cfg_path='configs/yamls/demo.yaml'):
-        print("[*] Initializing WHAM + LMA Processor...")
+        print("[*] Initializing KineGuard WHAM Processor...")
         self.cfg = get_cfg_defaults()
         self.cfg.DEVICE = f'cuda:0' if torch.cuda.is_available() else 'cpu'
 
@@ -100,6 +88,9 @@ class WHAMLMAProcessor:
 
     def preprocess_video(self, video_path, output_pth, calib=None, use_slam=True):
         """Replaces Phase 1: 2D Extraction."""
+
+        # Reset detector state from previous video (critical for shared processor)
+        self.detector.initialize_tracking()
 
         with torch.no_grad():
             cap = cv2.VideoCapture(video_path)
@@ -194,11 +185,7 @@ class WHAMLMAProcessor:
                     results[_id]['verts'] = verts_cam + trans_cam[:, None, :] # Broadcast trans to (T, 1, 3)
                     
                     # 6. Store our LMA-specific parameters!
-                    results[_id]['joints_world'] = joints_world
-
-                    # 7. Original 2D keypoints from ViTPose (pixel coords, for overlay)
-                    kp2d = dataset.tracking_results[_id]['keypoints']  # (T, 17, 3) — x, y, conf
-                    results[_id]['keypoints_2d'] = kp2d
+                    results[_id]['joints_world'] = joints_world 
                     results[_id]['verts_world'] = verts_world
 
             if not results:
@@ -211,7 +198,7 @@ class WHAMLMAProcessor:
                 frames = data['frame_ids']
                 
                 # Optional: Skip noise/glitches (e.g., tracks shorter than 1 second)
-                if len(frames) < 15:
+                if len(frames) < 30:
                     print(f"[*] Skipping ID {_id} (Too short: {len(frames)} frames)")
                     continue
                     
@@ -222,11 +209,7 @@ class WHAMLMAProcessor:
                 np.savez(
                     out_npz,
                     joints=data['joints_world'],
-                    keypoints_2d=data['keypoints_2d'],
                     verts=data['verts_world'],
-                    pose_world=data['pose_world'],
-                    betas=data['betas'],
-                    trans_world=data['trans_world'],
                     frame_ids=frames,
                     fps=fps
                 )
@@ -280,26 +263,52 @@ class WHAMLMAProcessor:
         finally:
             os.chdir(original_cwd)
 
+_shared_processor = None  # Set by init_worker in batch_processor.py (once per worker)
+
 def process_single_video(video_path, output_root, visualize=False):
     """
-    Worker function for multiprocessing. 
-    Each process creates its own WHAMLMAProcessor instance.
+    Worker function for multiprocessing.
+    Reuses _shared_processor created in init_worker (no repeated model loading).
     """
+    global _shared_processor
+    if _shared_processor is not None:
+        processor = _shared_processor
+    else:
+        # Fallback: if not running via batch_processor pool, create one
+        processor = KineGuardWHAMProcessor()
+
+    # Clear GPU cache between videos to prevent memory accumulation
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     video_path = os.path.abspath(video_path)
     output_root = os.path.abspath(output_root)
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     video_output_dir = os.path.join(output_root, video_name)
     os.makedirs(video_output_dir, exist_ok=True)
-    
-    # Pass the device_id here
-    processor = WHAMLMAProcessor()
 
     try:
         fragments, fps = processor.run_pipeline(video_path, video_output_dir, visualize=visualize)
-    except Exception as e:
-        print(f"⚠️ Video processing failed (Likely exceeded frame buffer): {video_path}")
+    except RuntimeError as e:
+        if 'CUDA' in str(e):
+            # CUDA errors corrupt the entire GPU context — this worker must die.
+            # maxtasksperchild in Pool will spawn a fresh worker automatically.
+            import traceback
+            print(f"[FATAL CUDA] Worker {os.getpid()} hit CUDA error on {video_path}")
+            traceback.print_exc()
+            # Force-kill this worker so Pool replaces it with a clean one
+            os._exit(1)
+        import traceback
+        print(f"⚠️ Video processing failed: {video_path}")
         print(f"Error: {e}")
+        traceback.print_exc()
+        return False, "Skipped due to RuntimeError"
+    except Exception as e:
+        import traceback
+        print(f"⚠️ Video processing failed: {video_path}")
+        print(f"Error type: {type(e).__name__}")
+        print(f"Error: {e}")
+        traceback.print_exc()
         return False, "Skipped due to internal WHAM/DPVO error"
 
     summary = {
@@ -383,7 +392,7 @@ def process_single_video(video_path, output_root, visualize=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="output/wham_lma")
+    parser.add_argument("--output_dir", type=str, default="output/wham_kineguard")
     parser.add_argument("--viz", action='store_true')
     opts = parser.parse_args()
 
