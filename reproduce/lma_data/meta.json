@@ -1,0 +1,11 @@
+{
+  "n_fragments": 7251,
+  "n_features": 122,
+  "seed": 42,
+  "tasks": [
+    "binary",
+    "3way_drop",
+    "4way"
+  ],
+  "feature_dim": "122 = mean+std of 61 per-frame LMA descriptors"
+}

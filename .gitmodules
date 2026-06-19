@@ -1,0 +1,4 @@
+[submodule "external/dance-style-recognition"]
+	path = external/dance-style-recognition
+	url = https://github.com/zaiisao/dance-style-recognition.git
+	branch = main
