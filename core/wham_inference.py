@@ -1,25 +1,3 @@
-"""WHAM inference driver for the suggestive-motion pipeline.
-
-ATTRIBUTION. The per-video inference orchestration here — `preprocess_video()` and the
-Phase-2 forward loop — is ADAPTED (a near line-for-line port) from WHAM's own `demo.py`
-`run()` (yohanshin/WHAM, CC BY-NC research license); the detection / ViTPose / SLAM /
-network-forward calls are WHAM library APIs used unchanged. FIRST-PARTY (ours): the
-SMPL-24 `J_regressor @ verts` joint fix, the per-fragment `.npz` output + ffmpeg crops,
-and the spawn / single-thread-BLAS / CUDA-recovery infrastructure.
-
-WHAM is run from a MODIFIED FORK (zaiisao/WHAM @ baca651), not stock WHAM: YOLO26x
-detector, ViTPose++ (base, MoE/UDP) 2D, OKS cross-frame association, and full-fp32 SLAM.
-Every deviation from upstream is enumerated in docs/wham_fork_vs_official_audit_2026-06-09.md.
-
-PIPELINE NOTE. This driver's job is to produce the per-fragment WHAM `.npz`. The canonical,
-data-producing LMA features are computed by `scripts/extract_lma_features.py` from the
-CAMERA-FRAME mesh vertices (`J_regressor @ verts`, no `trans_world`). The published
-features.npz was built from a minimal camera-frame npz (`joints, verts, frame_ids, fps`);
-this driver's job ends at the `.npz`; the LMA is computed downstream by
-`scripts/extract_lma_features.py` (camera-frame `J_regressor @ verts` + mesh volumes), the
-single canonical WHAM -> LMA path. (The richer/world-frame npz schema saved below is a
-known follow-up to reconcile with that camera-frame stage; see the audit doc.)
-"""
 import sys
 import os
 import multiprocessing as _mp
@@ -57,9 +35,7 @@ for p in [wham_root, dpvo_path, lma_path, vitpose_path]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-# NOTE: SLAMModel is intentionally NOT imported here. It is imported lazily in
-# the try/except block below so a missing/broken DPVO build only disables global
-# trajectory (_run_global=False) rather than crashing this module at import time.
+from lib.models.preproc.slam import SLAMModel
 
 import cv2
 import torch
@@ -71,6 +47,7 @@ from glob import glob
 from collections import defaultdict
 from progress.bar import Bar
 from loguru import logger
+from scipy.spatial import ConvexHull
 
 from configs.config import get_cfg_defaults
 from lib.data.datasets import CustomDataset
@@ -81,6 +58,8 @@ from lib.models.preproc.detector import DetectionModel
 from lib.models.preproc.extractor import FeatureExtractor
 from lib.models.smplify import TemporalSMPLify
 from lib.vis.run_vis import run_vis_on_demo
+
+from process_lma_features import compute_lma_descriptor, IdentityFloor
 
 import subprocess
 
@@ -121,11 +100,6 @@ class WHAMLMAProcessor:
 
     def preprocess_video(self, video_path, output_pth, calib=None, use_slam=True):
         """Replaces Phase 1: 2D Extraction."""
-
-        # Reset detector tracking state from any previous video. Critical when a
-        # single processor instance is reused across videos (e.g. batch mode),
-        # otherwise tracks leak across videos and corrupt fragment IDs.
-        self.detector.initialize_tracking()
 
         with torch.no_grad():
             cap = cv2.VideoCapture(video_path)
@@ -198,7 +172,7 @@ class WHAMLMAProcessor:
                     
                     # 4. Extract 3D data, apply world translation, and strip the dummy batch dimension
                     trans_world = pred['trans_world'].reshape(1, -1, 1, 3) # (1, T, 1, 3)
-                    joints_world = (smpl_output.joints + trans_world).cpu().squeeze(0).numpy() # -> (T, 31, 3) COCO+SPIN (NOT SMPL-24; see LMA fix below)
+                    joints_world = (smpl_output.joints + trans_world).cpu().squeeze(0).numpy() # -> (T, 45, 3)
                     verts_world = (smpl_output.vertices + trans_world).cpu().squeeze(0).numpy() # -> (T, 6890, 3)
                     
                     # 5. Restore all original WHAM dictionary keys for the visualizer
@@ -321,32 +295,11 @@ def process_single_video(video_path, output_root, visualize=False):
     # Pass the device_id here
     processor = WHAMLMAProcessor()
 
-    # Clear any GPU cache left from a previous video to curb memory growth.
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
     try:
         fragments, fps = processor.run_pipeline(video_path, video_output_dir, visualize=visualize)
-    except RuntimeError as e:
-        if 'CUDA' in str(e):
-            # A CUDA error corrupts the whole GPU context — this worker can't be
-            # trusted again. Exit hard so a Pool with maxtasksperchild respawns a
-            # clean worker instead of cascading the failure onto later videos.
-            import traceback
-            print(f"[FATAL CUDA] Worker {os.getpid()} hit a CUDA error on {video_path}")
-            traceback.print_exc()
-            os._exit(1)
-        import traceback
-        print(f"⚠️ Video processing failed: {video_path}")
-        print(f"Error: {e}")
-        traceback.print_exc()
-        return False, "Skipped due to RuntimeError"
     except Exception as e:
-        import traceback
-        print(f"⚠️ Video processing failed (likely exceeded frame buffer): {video_path}")
-        print(f"Error type: {type(e).__name__}")
+        print(f"⚠️ Video processing failed (Likely exceeded frame buffer): {video_path}")
         print(f"Error: {e}")
-        traceback.print_exc()
         return False, "Skipped due to internal WHAM/DPVO error"
 
     summary = {
@@ -371,12 +324,53 @@ def process_single_video(video_path, output_root, visualize=False):
             json.dump(summary, f, indent=2)
         return False, f"No valid fragments: {video_path}"
 
-    # This driver's output is the per-fragment WHAM .npz saved above. The LMA descriptors are
-    # NOT computed here: that is the job of scripts/extract_lma_features.py, the single
-    # canonical WHAM -> LMA path (camera-frame J_regressor@verts + mesh-hull volumes ->
-    # the descriptor). Keeping it one place avoids duplicating (and drifting from) that code.
-    print(f"\n[+] WHAM complete for {video_name}: {len(fragments)} fragment(s) saved.")
-    summary['written_files'] = [f"wham_fragment_id{_id}.npz" for _id in fragments]
+    saved_lma_count = 0
+    if fragments:
+        print(f"\n[+] WHAM Complete for {video_name}. Starting LMA Integration...")
+        for _id, data in fragments.items():
+            print(f"[*] Extracting LMA features for Fragment {_id}...")
+            
+            joints = data['joints_world'][:, :24, :]
+            verts_array = data['verts_world']
+            
+            # A. Calculate Volumes
+            volumes = []
+            last_v = 0.07 
+            for verts in verts_array:
+                try:
+                    v = ConvexHull(verts).volume
+                    volumes.append(v)
+                    last_v = v
+                except Exception:
+                    volumes.append(last_v)
+            
+            floors = [IdentityFloor()] * len(joints)
+            
+            # B. Call LMA logic
+            try:
+                lma_dict, lma_matrix = compute_lma_descriptor(
+                    joints=joints, 
+                    volumes=volumes, 
+                    floors=floors, 
+                    fps=fps, 
+                    window_size=55
+                )
+                
+                # C. Save results
+                np.save(osp.join(video_output_dir, f"lma_features_id{_id}.npy"), lma_matrix)
+                np.save(osp.join(video_output_dir, f"lma_dict_id{_id}.npy"), lma_dict)
+                summary['written_files'].append(f"lma_features_id{_id}.npy")
+                summary['written_files'].append(f"lma_dict_id{_id}.npy")
+                saved_lma_count += 1
+            except Exception as exc:
+                print(f"[!] Failed to compute/save LMA for Fragment {_id}: {exc}")
+
+    if saved_lma_count == 0:
+        summary['reason'] = 'No LMA outputs written'
+        summary_path = osp.join(video_output_dir, 'summary.json')
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        return False, f"No LMA outputs written: {video_path}"
 
     summary['status'] = 'success'
     summary['reason'] = ''
