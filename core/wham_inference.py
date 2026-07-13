@@ -22,26 +22,13 @@ known follow-up to reconcile with that camera-frame stage; see the audit doc.)
 """
 import sys
 import os
-import multiprocessing as _mp
-# Force spawn so DataLoader / DPVO / multiprocessing workers don't inherit
-# the parent's mid-init CUDA contexts (causes a futex/pipe deadlock where
-# all workers park forever and the 10-min watchdog can't reach them).
-try:
-    _mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    pass
-# Single-threaded BLAS keeps fork-safe libraries from spawning their own
-# thread pools that race with PyTorch's CUDA initialization.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-
 import numpy as np
 np.float = float
 
 sys.setrecursionlimit(5000)
 
 # 1. Get Absolute Path to the project root
-# This assumes wham_inference.py is in <repo>/core/
+# This assumes wham_inference.py is in KineGuard/core/
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, ".."))
 
@@ -57,9 +44,8 @@ for p in [wham_root, dpvo_path, lma_path, vitpose_path]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-# NOTE: SLAMModel is intentionally NOT imported here. It is imported lazily in
-# the try/except block below so a missing/broken DPVO build only disables global
-# trajectory (_run_global=False) rather than crashing this module at import time.
+# NOTE: SLAMModel import is intentionally deferred to the try/except block
+# below so a missing/broken DPVO build only disables global trajectory.
 
 import cv2
 import torch
@@ -71,6 +57,7 @@ from glob import glob
 from collections import defaultdict
 from progress.bar import Bar
 from loguru import logger
+from scipy.spatial import ConvexHull
 
 from configs.config import get_cfg_defaults
 from lib.data.datasets import CustomDataset
@@ -82,6 +69,8 @@ from lib.models.preproc.extractor import FeatureExtractor
 from lib.models.smplify import TemporalSMPLify
 from lib.vis.run_vis import run_vis_on_demo
 
+from process_lma_features import compute_lma_descriptor, IdentityFloor
+
 import subprocess
 
 try: 
@@ -91,9 +80,9 @@ except ImportError:
     logger.warning('DPVO (SLAM) is not installed. Global trajectory will default to local camera space!')
     _run_global = False
 
-class WHAMLMAProcessor:
+class KineGuardWHAMProcessor:
     def __init__(self, cfg_path='configs/yamls/demo.yaml'):
-        print("[*] Initializing WHAM + LMA Processor...")
+        print("[*] Initializing KineGuard WHAM Processor...")
         self.cfg = get_cfg_defaults()
         self.cfg.DEVICE = f'cuda:0' if torch.cuda.is_available() else 'cpu'
 
@@ -122,9 +111,7 @@ class WHAMLMAProcessor:
     def preprocess_video(self, video_path, output_pth, calib=None, use_slam=True):
         """Replaces Phase 1: 2D Extraction."""
 
-        # Reset detector tracking state from any previous video. Critical when a
-        # single processor instance is reused across videos (e.g. batch mode),
-        # otherwise tracks leak across videos and corrupt fragment IDs.
+        # Reset detector state from previous video (critical for shared processor)
         self.detector.initialize_tracking()
 
         with torch.no_grad():
@@ -198,7 +185,7 @@ class WHAMLMAProcessor:
                     
                     # 4. Extract 3D data, apply world translation, and strip the dummy batch dimension
                     trans_world = pred['trans_world'].reshape(1, -1, 1, 3) # (1, T, 1, 3)
-                    joints_world = (smpl_output.joints + trans_world).cpu().squeeze(0).numpy() # -> (T, 31, 3) COCO+SPIN (NOT SMPL-24; see LMA fix below)
+                    joints_world = (smpl_output.joints + trans_world).cpu().squeeze(0).numpy() # -> (T, 45, 3)
                     verts_world = (smpl_output.vertices + trans_world).cpu().squeeze(0).numpy() # -> (T, 6890, 3)
                     
                     # 5. Restore all original WHAM dictionary keys for the visualizer
@@ -220,11 +207,7 @@ class WHAMLMAProcessor:
                     results[_id]['verts'] = verts_cam + trans_cam[:, None, :] # Broadcast trans to (T, 1, 3)
                     
                     # 6. Store our LMA-specific parameters!
-                    results[_id]['joints_world'] = joints_world
-
-                    # 7. Original 2D keypoints from ViTPose (pixel coords, for overlay)
-                    kp2d = dataset.tracking_results[_id]['keypoints']  # (T, 17, 3) — x, y, conf
-                    results[_id]['keypoints_2d'] = kp2d
+                    results[_id]['joints_world'] = joints_world 
                     results[_id]['verts_world'] = verts_world
 
             if not results:
@@ -237,7 +220,7 @@ class WHAMLMAProcessor:
                 frames = data['frame_ids']
                 
                 # Optional: Skip noise/glitches (e.g., tracks shorter than 1 second)
-                if len(frames) < 15:
+                if len(frames) < 30:
                     print(f"[*] Skipping ID {_id} (Too short: {len(frames)} frames)")
                     continue
                     
@@ -248,11 +231,7 @@ class WHAMLMAProcessor:
                 np.savez(
                     out_npz,
                     joints=data['joints_world'],
-                    keypoints_2d=data['keypoints_2d'],
                     verts=data['verts_world'],
-                    pose_world=data['pose_world'],
-                    betas=data['betas'],
-                    trans_world=data['trans_world'],
                     frame_ids=frames,
                     fps=fps
                 )
@@ -306,35 +285,40 @@ class WHAMLMAProcessor:
         finally:
             os.chdir(original_cwd)
 
+_shared_processor = None  # Set by init_worker in batch_processor.py (once per worker)
+
 def process_single_video(video_path, output_root, visualize=False):
     """
-    Worker function for multiprocessing. 
-    Each process creates its own WHAMLMAProcessor instance.
+    Worker function for multiprocessing.
+    Reuses _shared_processor created in init_worker (no repeated model loading).
     """
+    global _shared_processor
+    if _shared_processor is not None:
+        processor = _shared_processor
+    else:
+        # Fallback: if not running via batch_processor pool, create one
+        processor = KineGuardWHAMProcessor()
+
+    # Clear GPU cache between videos to prevent memory accumulation
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     video_path = os.path.abspath(video_path)
     output_root = os.path.abspath(output_root)
     video_name = os.path.splitext(os.path.basename(video_path))[0]
     video_output_dir = os.path.join(output_root, video_name)
     os.makedirs(video_output_dir, exist_ok=True)
-    
-    # Pass the device_id here
-    processor = WHAMLMAProcessor()
-
-    # Clear any GPU cache left from a previous video to curb memory growth.
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     try:
         fragments, fps = processor.run_pipeline(video_path, video_output_dir, visualize=visualize)
     except RuntimeError as e:
         if 'CUDA' in str(e):
-            # A CUDA error corrupts the whole GPU context — this worker can't be
-            # trusted again. Exit hard so a Pool with maxtasksperchild respawns a
-            # clean worker instead of cascading the failure onto later videos.
+            # CUDA errors corrupt the entire GPU context — this worker must die.
+            # maxtasksperchild in Pool will spawn a fresh worker automatically.
             import traceback
-            print(f"[FATAL CUDA] Worker {os.getpid()} hit a CUDA error on {video_path}")
+            print(f"[FATAL CUDA] Worker {os.getpid()} hit CUDA error on {video_path}")
             traceback.print_exc()
+            # Force-kill this worker so Pool replaces it with a clean one
             os._exit(1)
         import traceback
         print(f"⚠️ Video processing failed: {video_path}")
@@ -343,7 +327,7 @@ def process_single_video(video_path, output_root, visualize=False):
         return False, "Skipped due to RuntimeError"
     except Exception as e:
         import traceback
-        print(f"⚠️ Video processing failed (likely exceeded frame buffer): {video_path}")
+        print(f"⚠️ Video processing failed: {video_path}")
         print(f"Error type: {type(e).__name__}")
         print(f"Error: {e}")
         traceback.print_exc()
@@ -371,12 +355,53 @@ def process_single_video(video_path, output_root, visualize=False):
             json.dump(summary, f, indent=2)
         return False, f"No valid fragments: {video_path}"
 
-    # This driver's output is the per-fragment WHAM .npz saved above. The LMA descriptors are
-    # NOT computed here: that is the job of scripts/extract_lma_features.py, the single
-    # canonical WHAM -> LMA path (camera-frame J_regressor@verts + mesh-hull volumes ->
-    # the descriptor). Keeping it one place avoids duplicating (and drifting from) that code.
-    print(f"\n[+] WHAM complete for {video_name}: {len(fragments)} fragment(s) saved.")
-    summary['written_files'] = [f"wham_fragment_id{_id}.npz" for _id in fragments]
+    saved_lma_count = 0
+    if fragments:
+        print(f"\n[+] WHAM Complete for {video_name}. Starting LMA Integration...")
+        for _id, data in fragments.items():
+            print(f"[*] Extracting LMA features for Fragment {_id}...")
+            
+            joints = data['joints_world'][:, :24, :]
+            verts_array = data['verts_world']
+            
+            # A. Calculate Volumes
+            volumes = []
+            last_v = 0.07 
+            for verts in verts_array:
+                try:
+                    v = ConvexHull(verts).volume
+                    volumes.append(v)
+                    last_v = v
+                except Exception:
+                    volumes.append(last_v)
+            
+            floors = [IdentityFloor()] * len(joints)
+            
+            # B. Call LMA logic
+            try:
+                lma_dict, lma_matrix = compute_lma_descriptor(
+                    joints=joints, 
+                    volumes=volumes, 
+                    floors=floors, 
+                    fps=fps, 
+                    window_size=55
+                )
+                
+                # C. Save results
+                np.save(osp.join(video_output_dir, f"lma_features_id{_id}.npy"), lma_matrix)
+                np.save(osp.join(video_output_dir, f"lma_dict_id{_id}.npy"), lma_dict)
+                summary['written_files'].append(f"lma_features_id{_id}.npy")
+                summary['written_files'].append(f"lma_dict_id{_id}.npy")
+                saved_lma_count += 1
+            except Exception as exc:
+                print(f"[!] Failed to compute/save LMA for Fragment {_id}: {exc}")
+
+    if saved_lma_count == 0:
+        summary['reason'] = 'No LMA outputs written'
+        summary_path = osp.join(video_output_dir, 'summary.json')
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2)
+        return False, f"No LMA outputs written: {video_path}"
 
     summary['status'] = 'success'
     summary['reason'] = ''
@@ -389,7 +414,7 @@ def process_single_video(video_path, output_root, visualize=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="output/wham_lma")
+    parser.add_argument("--output_dir", type=str, default="output/wham_kineguard")
     parser.add_argument("--viz", action='store_true')
     opts = parser.parse_args()
 
